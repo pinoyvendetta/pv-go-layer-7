@@ -363,20 +363,15 @@ func buildUTLSConn(insecureTLS bool, sni string) func(ctx context.Context, netwo
 	}
 }
 
+// FIXED: Corrected HTTP/1.1 client creation to prevent handshake errors.
 func buildHTTPClient(config *workerConfig, httpVersion string) *http.Client {
 	sni := randomSNI(config.targetURL)
+	// This custom dialer performs the TCP dial and the full TLS handshake.
 	dialer := buildUTLSConn(config.insecureTLS, sni)
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
 
 	if httpVersion == "2" {
 		h2Transport := &http2.Transport{
+			// http2.Transport requires a connection that has already completed the TLS handshake.
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 				return dialer(ctx, network, addr)
 			},
@@ -384,8 +379,21 @@ func buildHTTPClient(config *workerConfig, httpVersion string) *http.Client {
 		return &http.Client{Transport: h2Transport, Timeout: 30 * time.Second}
 	}
 
-	// For HTTP/1.1, explicitly disable HTTP/2.
-	transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	// For HTTP/1.1, we must also use DialTLSContext. Using the older DialContext would
+	// cause the http.Transport to attempt a second, failing handshake over the already-encrypted stream.
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		// CORRECT: Use DialTLSContext because our dialer provides a connection that has already been handshaked.
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer(ctx, network, addr)
+		},
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// This is crucial: it disables ALPN, which prevents the connection from upgrading to HTTP/2, forcing HTTP/1.1.
+		TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
+	}
 	return &http.Client{Transport: transport, Timeout: 30 * time.Second}
 }
 
